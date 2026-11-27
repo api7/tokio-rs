@@ -149,3 +149,14 @@ pub(crate) fn unsupported() -> io::Error {
         "only `TcpStream` and `UdpSocket` are supported with external I/O",
     )
 }
+
+/// Fails if the current runtime uses external I/O, which cannot watch child
+/// processes. `tokio::process` checks this before it starts a child process,
+/// so that a failed spawn leaves no process behind.
+#[cfg(feature = "process")]
+pub(crate) fn check_process_support() -> io::Result<()> {
+    match crate::runtime::Handle::try_current() {
+        Ok(handle) if handle.inner.driver().is_external_io() => Err(unsupported()),
+        _ => Ok(()),
+    }
+}
