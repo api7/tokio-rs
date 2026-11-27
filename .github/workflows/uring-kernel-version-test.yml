@@ -10,7 +10,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4
     env:
       KERNEL_VERSION: ${{ inputs.kernel_version }}
     steps:
