@@ -234,9 +234,18 @@ Prefer the LTS releases listed in the upstream README.
    description, so that reviewers can see how every patch changed.
 4. Once checks pass and the review approves, merge it. If a shipped APISIX
    release still uses the old line, push the old `dev` tip as
-   `apisix/<old version>`. Then a maintainer moves `dev` to the new line with
-   `git push --force-with-lease=dev:<old dev commit> origin apisix/<new version>:dev`
-   and cuts a release.
+   `apisix/<old version>`. Then a maintainer moves `dev` to the merged line.
+   Push the fetched remote branch, not a local one, which may still be at the
+   bare upstream tag, and lint it first:
+
+   ```sh
+   git fetch origin
+   apisix/scripts/check-series.sh --verify-upstream origin/apisix/<new version>
+   git push --force-with-lease=dev:<old dev commit> origin \
+       refs/remotes/origin/apisix/<new version>:refs/heads/dev
+   ```
+
+   Then cut a release.
 
 ## Releases
 
