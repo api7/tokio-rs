@@ -182,10 +182,7 @@ impl Handle {
         match &self.backend {
             Backend::Mio { registry, .. } => Ok(registry),
             #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
-            Backend::External(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "only `TcpStream` and `UdpSocket` are supported with external I/O",
-            )),
+            Backend::External(_) => Err(super::external::unsupported()),
         }
     }
 

@@ -253,6 +253,12 @@ impl Handle {
         let probe = self
             .uring_probe
             .get_or_try_init(|| async {
+                // Without a Mio registry to watch the ring's completions with,
+                // file operations use the blocking pool.
+                #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+                if self.is_external() {
+                    return Ok(None);
+                }
                 let mut probe = Probe::new();
                 match self.try_init(&mut probe) {
                     Ok(()) => Ok(Some(probe)),

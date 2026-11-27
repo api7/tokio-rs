@@ -1207,13 +1207,16 @@ impl Builder {
     /// The I/O and time drivers are always enabled, whatever [`enable_io`] and
     /// [`enable_time`] say, and the park callbacks are never called. As with
     /// [`build_local`], the runtime can only be used on the thread that
-    /// creates it.
+    /// creates it. Its clock cannot be paused, as a paused clock only advances
+    /// while the runtime waits by itself: `time::pause` panics on it.
     ///
     /// # Errors
     ///
     /// Returns an error of kind [`ErrorKind::InvalidInput`] if the builder was
-    /// not created with [`Builder::new_current_thread`], or if the clock is set
-    /// to start paused.
+    /// not created with [`Builder::new_current_thread`], if the clock is set to
+    /// start paused, or, with `tokio_unstable`, if a panicking task is set to
+    /// shut down the runtime with `UnhandledPanic::ShutdownRuntime`, which a
+    /// tick cannot report.
     ///
     /// [`runtime::external_io`]: crate::runtime::external_io
     /// [`TcpStream`]: crate::net::TcpStream
@@ -1237,6 +1240,13 @@ impl Builder {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "external I/O requires a current-thread runtime and an unpaused clock",
+            ));
+        }
+        #[cfg(tokio_unstable)]
+        if matches!(self.unhandled_panic, UnhandledPanic::ShutdownRuntime) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external I/O does not support `UnhandledPanic::ShutdownRuntime`",
             ));
         }
         let owner = std::thread::current().id();
@@ -1835,6 +1845,7 @@ impl Builder {
         #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
         if external_io.is_some() {
             cfg.enable_time = true;
+            cfg.enable_pause_time = false;
             cfg.external_io = external_io;
         }
         let (driver, driver_handle) = driver::Driver::new(cfg)?;
