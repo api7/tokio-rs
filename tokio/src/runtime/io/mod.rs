@@ -3,6 +3,8 @@
     allow(dead_code)
 )]
 mod driver;
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+pub(crate) mod external;
 use driver::{Direction, Tick};
 pub(crate) use driver::{Driver, Handle, ReadyEvent};
 cfg_io_uring! {

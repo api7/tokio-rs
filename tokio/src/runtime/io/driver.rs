@@ -22,6 +22,11 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+use crate::runtime::external_io::{ExternalIo, ExternalReadiness, ExternalRegistration};
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+use std::os::fd::BorrowedFd;
+
 /// I/O driver, backed by Mio.
 pub(crate) struct Driver {
     /// True when an event with the signal token is received
@@ -40,19 +45,13 @@ pub(crate) struct Driver {
 
 /// A reference to an I/O driver.
 pub(crate) struct Handle {
-    /// Registers I/O resources.
-    registry: mio::Registry,
+    backend: Backend,
 
     /// Tracks all registrations
     registrations: RegistrationSet,
 
     /// State that should be synchronized
     synced: Mutex<registration_set::Synced>,
-
-    /// Used to wake up the reactor from a call to `turn`.
-    /// Not supported on `Wasi` due to lack of threading support.
-    #[cfg(not(target_os = "wasi"))]
-    waker: mio::Waker,
 
     pub(crate) metrics: IoDriverMetrics,
 
@@ -73,6 +72,16 @@ pub(crate) struct Handle {
         target_os = "linux",
     ))]
     pub(crate) uring_probe: OnceCell<Option<io_uring::Probe>>,
+}
+
+enum Backend {
+    Mio {
+        registry: mio::Registry,
+        #[cfg(not(target_os = "wasi"))]
+        waker: mio::Waker,
+    },
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    External(std::sync::Arc<dyn ExternalIo>),
 }
 
 #[derive(Debug)]
@@ -132,14 +141,23 @@ impl Driver {
             poll,
         };
 
-        let (registrations, synced) = RegistrationSet::new();
-
-        let handle = Handle {
+        let handle = Handle::new(Backend::Mio {
             registry,
-            registrations,
-            synced: Mutex::new(synced),
             #[cfg(not(target_os = "wasi"))]
             waker,
+        });
+
+        Ok((driver, handle))
+    }
+}
+
+impl Handle {
+    fn new(backend: Backend) -> Self {
+        let (registrations, synced) = RegistrationSet::new();
+        Self {
+            backend,
+            registrations,
+            synced: Mutex::new(synced),
             metrics: IoDriverMetrics::default(),
             #[cfg(all(
                 tokio_unstable,
@@ -157,11 +175,83 @@ impl Driver {
                 target_os = "linux",
             ))]
             uring_probe: OnceCell::new(),
-        };
-
-        Ok((driver, handle))
+        }
     }
 
+    fn mio_registry(&self) -> io::Result<&mio::Registry> {
+        match &self.backend {
+            Backend::Mio { registry, .. } => Ok(registry),
+            #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+            Backend::External(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "only `TcpStream` and `UdpSocket` are supported with external I/O",
+            )),
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let ios = self.registrations.shutdown(&mut self.synced.lock());
+
+        // `shutdown()` must be called without holding the lock.
+        for io in ios {
+            io.shutdown();
+        }
+    }
+
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) fn new_external(backend: std::sync::Arc<dyn ExternalIo>) -> Self {
+        Self::new(Backend::External(backend))
+    }
+
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) fn is_external(&self) -> bool {
+        matches!(self.backend, Backend::External(_))
+    }
+
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(super) fn add_external(
+        &self,
+        fd: BorrowedFd<'_>,
+        interest: Interest,
+    ) -> io::Result<(
+        Arc<ScheduledIo>,
+        ExternalReadiness,
+        Box<dyn ExternalRegistration>,
+    )> {
+        let Backend::External(backend) = &self.backend else {
+            unreachable!("external registration requires external backend");
+        };
+        let io = self.registrations.allocate(&mut self.synced.lock())?;
+        let sink = ExternalReadiness::new(io.clone());
+        let watch = match backend.register(fd, interest, sink.clone()) {
+            Ok(watch) => watch,
+            Err(error) => {
+                sink.invalidate();
+                // SAFETY: this call owns the newly allocated registration.
+                unsafe {
+                    self.registrations
+                        .remove_external(&mut self.synced.lock(), &io)
+                };
+                return Err(error);
+            }
+        };
+        self.metrics.incr_fd_count();
+        Ok((io, sink, watch))
+    }
+
+    /// The caller must own `registration` and remove it only once.
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(super) unsafe fn remove_external(&self, registration: &Arc<ScheduledIo>) {
+        // SAFETY: the caller owns the one external registration being removed.
+        unsafe {
+            self.registrations
+                .remove_external(&mut self.synced.lock(), registration);
+        }
+        self.metrics.dec_fd_count();
+    }
+}
+
+impl Driver {
     pub(crate) fn park(&mut self, rt_handle: &driver::Handle) {
         let handle = rt_handle.io();
         self.turn(handle, None);
@@ -173,13 +263,7 @@ impl Driver {
     }
 
     pub(crate) fn shutdown(&mut self, rt_handle: &driver::Handle) {
-        let handle = rt_handle.io();
-        let ios = handle.registrations.shutdown(&mut handle.synced.lock());
-
-        // `shutdown()` must be called without holding the lock.
-        for io in ios {
-            io.shutdown();
-        }
+        rt_handle.io().shutdown();
     }
 
     fn turn(&mut self, handle: &Handle, max_wait: Option<Duration>) {
@@ -275,8 +359,18 @@ impl Handle {
     /// blocked in `turn`, then the next call to `turn` will not block and
     /// return immediately.
     pub(crate) fn unpark(&self) {
-        #[cfg(not(target_os = "wasi"))]
-        self.waker.wake().expect("failed to wake I/O driver");
+        match &self.backend {
+            Backend::Mio {
+                #[cfg(not(target_os = "wasi"))]
+                waker,
+                ..
+            } => {
+                #[cfg(not(target_os = "wasi"))]
+                waker.wake().expect("failed to wake I/O driver");
+            }
+            #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+            Backend::External(backend) => backend.wake(),
+        }
     }
 
     /// Registers an I/O resource with the reactor for a given `mio::Ready` state.
@@ -287,12 +381,13 @@ impl Handle {
         source: &mut impl mio::event::Source,
         interest: Interest,
     ) -> io::Result<Arc<ScheduledIo>> {
+        let registry = self.mio_registry()?;
         let scheduled_io = self.registrations.allocate(&mut self.synced.lock())?;
         let token = scheduled_io.token();
 
         // we should remove the `scheduled_io` from the `registrations` set if registering
         // the `source` with the OS fails. Otherwise it will leak the `scheduled_io`.
-        if let Err(e) = self.registry.register(source, token, interest.to_mio()) {
+        if let Err(e) = registry.register(source, token, interest.to_mio()) {
             // safety: `scheduled_io` is part of the `registrations` set.
             unsafe {
                 self.registrations
@@ -322,7 +417,7 @@ impl Handle {
         // duplicated before the original fd number was closed, the open file
         // description remains registered in epoll with the `ScheduledIo` token
         // pointer even though `EPOLL_CTL_DEL` fails with `EBADF`.
-        self.registry.deregister(source)?;
+        self.mio_registry()?.deregister(source)?;
 
         if self
             .registrations

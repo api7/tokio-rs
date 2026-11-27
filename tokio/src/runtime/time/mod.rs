@@ -287,7 +287,20 @@ impl Driver {
 }
 
 impl Handle {
-    pub(self) fn process(&self, clock: &Clock) {
+    /// Returns how long the host may wait until the next timer, and records
+    /// that deadline, so that registering an earlier timer wakes the host.
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) fn external_io_next_sleep(&self, clock: &Clock) -> Option<Duration> {
+        let mut lock = self.inner.lock();
+        let next = lock.wheel.next_expiration_time();
+        lock.next_wake = next.and_then(|when| NonZeroU64::new(when.max(1)));
+        next.map(|when| {
+            self.time_source
+                .tick_to_duration(when.saturating_sub(self.time_source.now(clock)))
+        })
+    }
+
+    pub(in crate::runtime) fn process(&self, clock: &Clock) {
         let now = self.time_source().now(clock);
 
         self.process_at_time(now);

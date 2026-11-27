@@ -239,6 +239,49 @@ impl CurrentThread {
         })
     }
 
+    /// Runs the due timers and up to `max_tasks` tasks for a host event loop,
+    /// and returns when the host should tick again. See
+    /// `LocalRuntime::external_io_tick`.
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) fn external_io_tick(
+        &self,
+        handle: &scheduler::Handle,
+        max_tasks: usize,
+    ) -> Option<std::time::Duration> {
+        crate::runtime::context::enter_runtime(handle, false, |_blocking| {
+            let handle = handle.as_current_thread();
+            let guard = self
+                .take_core(handle)
+                .expect("`external_io_tick` called while the runtime is running");
+            guard.enter(|core, context| {
+                let driver = &context.handle.driver;
+                let (mut core, ()) = context.enter(core, || {
+                    driver.time().process(driver.clock());
+                });
+                core.metrics.start_processing_scheduled_tasks();
+                for _ in 0..max_tasks {
+                    core.tick();
+                    let Some(task) = core.next_task(&context.handle) else {
+                        break;
+                    };
+                    let task = context.handle.shared.owned.assert_owner(task);
+                    core = context.run_task(task, core);
+                }
+                let (mut core, next) = context.enter(core, || {
+                    context.defer.wake();
+                    driver.time().external_io_next_sleep(driver.clock())
+                });
+                core.metrics.end_processing_scheduled_tasks();
+                core.submit_metrics(&context.handle);
+                if !core.tasks.is_empty() || context.handle.injection_queue_depth() != 0 {
+                    (core, Some(std::time::Duration::ZERO))
+                } else {
+                    (core, next)
+                }
+            })
+        })
+    }
+
     fn take_core(&self, handle: &Arc<Handle>) -> Option<CoreGuard<'_>> {
         let core = self.core.take()?;
 

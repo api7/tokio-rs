@@ -427,6 +427,85 @@ pub(crate) mod driver;
 
 pub(crate) mod scheduler;
 
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(feature = "external-io-probe", target_os = "linux")))
+)]
+pub mod external_io {
+    //! Drives a [`LocalRuntime`] from a host event loop.
+    //!
+    //! **Experimental.** This module is only available on Linux with the
+    //! `external-io-probe` feature, and its API may change.
+    //!
+    //! A runtime built with [`Builder::build_local_with_external_io`] does not
+    //! wait for I/O or timers itself. The host does the waiting: it watches
+    //! the sockets that Tokio registers with its [`ExternalIo`] backend,
+    //! reports their readiness with [`ExternalReadiness::deliver`], and calls
+    //! [`LocalRuntime::external_io_tick`] to run due timers and ready tasks.
+    //! The value that a tick returns tells the host how long it may wait
+    //! before the next one, and [`ExternalIo::wake`] asks for an earlier tick.
+    //!
+    //! Only [`TcpStream`] and [`UdpSocket`] are registered with the host.
+    //! Other I/O resources are not supported on such a runtime: for example,
+    //! [`TcpListener::bind`] fails with [`ErrorKind::Unsupported`], and
+    //! creating a signal listener panics.
+    //!
+    //! The runtime never waits by itself, so drive it with ticks:
+    //! [`LocalRuntime::block_on`] panics.
+    //!
+    //! # Examples
+    //!
+    //! A backend that the host would connect to its event loop. This example
+    //! only runs a task that needs no I/O.
+    //!
+    //! ```
+    //! use std::io;
+    //! use std::os::fd::BorrowedFd;
+    //! use std::sync::Arc;
+    //! use tokio::io::Interest;
+    //! use tokio::runtime::external_io::{ExternalIo, ExternalReadiness, ExternalRegistration};
+    //!
+    //! struct Host;
+    //!
+    //! impl ExternalIo for Host {
+    //!     fn register(
+    //!         &self,
+    //!         _fd: BorrowedFd<'_>,
+    //!         _interest: Interest,
+    //!         _sink: ExternalReadiness,
+    //!     ) -> io::Result<Box<dyn ExternalRegistration>> {
+    //!         // Add the descriptor to the host event loop here, and call
+    //!         // `sink.deliver` when it reports readiness.
+    //!         Err(io::ErrorKind::Unsupported.into())
+    //!     }
+    //!
+    //!     fn wake(&self) {
+    //!         // Schedule a tick of the runtime here.
+    //!     }
+    //! }
+    //!
+    //! let mut rt = tokio::runtime::Builder::new_current_thread()
+    //!     .build_local_with_external_io(Arc::new(Host))
+    //!     .unwrap();
+    //! let task = rt.spawn_local(async { 1 + 1 });
+    //!
+    //! // A host would wait for readiness or a wake between ticks.
+    //! while rt.external_io_tick(64).is_some() {}
+    //! assert!(task.is_finished());
+    //! ```
+    //!
+    //! [`LocalRuntime`]: crate::runtime::LocalRuntime
+    //! [`LocalRuntime::block_on`]: crate::runtime::LocalRuntime::block_on
+    //! [`LocalRuntime::external_io_tick`]: crate::runtime::LocalRuntime::external_io_tick
+    //! [`Builder::build_local_with_external_io`]: crate::runtime::Builder::build_local_with_external_io
+    //! [`TcpStream`]: crate::net::TcpStream
+    //! [`UdpSocket`]: crate::net::UdpSocket
+    //! [`TcpListener::bind`]: crate::net::TcpListener::bind
+    //! [`ErrorKind::Unsupported`]: std::io::ErrorKind::Unsupported
+    pub use super::io::external::{ExternalIo, ExternalReadiness, ExternalRegistration};
+}
+
 cfg_io_driver_impl! {
     pub(crate) mod io;
 }

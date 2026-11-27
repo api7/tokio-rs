@@ -173,6 +173,9 @@ impl UdpSocket {
 
     #[track_caller]
     fn new(socket: mio::net::UdpSocket) -> io::Result<UdpSocket> {
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        let io = PollEvented::new_socket(socket)?;
+        #[cfg(not(all(feature = "external-io-probe", target_os = "linux")))]
         let io = PollEvented::new(socket)?;
         Ok(UdpSocket { io })
     }

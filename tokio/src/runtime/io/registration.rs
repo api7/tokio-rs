@@ -9,6 +9,24 @@ use mio::event::Source;
 use std::io;
 use std::task::{ready, Context, Poll};
 
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+use crate::runtime::external_io::{ExternalReadiness, ExternalRegistration};
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+use std::os::fd::{BorrowedFd, OwnedFd};
+
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+struct External {
+    sink: ExternalReadiness,
+    watch: Box<dyn ExternalRegistration>,
+}
+
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+impl std::fmt::Debug for External {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("External")
+    }
+}
+
 cfg_io_driver! {
     /// Associates an I/O resource with the reactor instance that drives it.
     ///
@@ -51,6 +69,9 @@ cfg_io_driver! {
 
         /// Reference to state stored by the driver.
         shared: Arc<ScheduledIo>,
+
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        external: Option<External>,
     }
 }
 
@@ -77,7 +98,50 @@ impl Registration {
     ) -> io::Result<Registration> {
         let shared = handle.driver().io().add_source(io, interest)?;
 
-        Ok(Registration { handle, shared })
+        Ok(Registration {
+            handle,
+            shared,
+            #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+            external: None,
+        })
+    }
+
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) fn new_external(
+        fd: BorrowedFd<'_>,
+        interest: Interest,
+        handle: scheduler::Handle,
+    ) -> io::Result<Self> {
+        let (shared, sink, watch) = handle.driver().io().add_external(fd, interest)?;
+        Ok(Self {
+            handle,
+            shared,
+            external: Some(External { sink, watch }),
+        })
+    }
+
+    /// On error, the registration is kept so that it can still be retired.
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) fn detach_external(&mut self) -> io::Result<()> {
+        let external = self
+            .external
+            .as_ref()
+            .expect("missing external registration");
+        external.sink.invalidate();
+        external.watch.detach()?;
+        self.external.take();
+        // SAFETY: taking the option makes this registration's removal unique.
+        unsafe { self.handle().remove_external(&self.shared) };
+        Ok(())
+    }
+
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) fn retire_external(&mut self, fd: OwnedFd) {
+        let external = self.external.take().expect("missing external registration");
+        external.sink.invalidate();
+        external.watch.retire(fd);
+        // SAFETY: taking the option makes this registration's removal unique.
+        unsafe { self.handle().remove_external(&self.shared) };
     }
 
     /// Deregisters the I/O resource from the reactor it is associated with.

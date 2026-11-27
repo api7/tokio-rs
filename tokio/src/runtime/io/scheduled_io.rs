@@ -238,6 +238,23 @@ impl ScheduledIo {
         });
     }
 
+    /// Sets readiness that a host event loop reports, unless the I/O driver
+    /// has shut down. Returns `false` if it has.
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(super) fn set_external_readiness(&self, ready: Ready) -> bool {
+        self.readiness
+            .fetch_update(AcqRel, Acquire, |curr| {
+                if SHUTDOWN.unpack(curr) != 0 {
+                    return None;
+                }
+                const MAX_TICK: usize = TICK.max_value() + 1;
+                let tick = TICK.unpack(curr).wrapping_add(1) % MAX_TICK;
+                let old = Ready::from_usize(READINESS.unpack(curr));
+                Some(TICK.pack(tick, (old | ready).as_usize()))
+            })
+            .is_ok()
+    }
+
     /// Notifies all pending waiters that have registered interest in `ready`.
     ///
     /// There may be many waiters to notify. Waking the pending task **must** be

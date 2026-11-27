@@ -66,6 +66,8 @@ cfg_io_driver! {
     pub(crate) struct PollEvented<E: Source> {
         io: Option<E>,
         registration: Registration,
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        into_owned_fd: Option<fn(E) -> std::os::fd::OwnedFd>,
     }
 }
 
@@ -121,7 +123,31 @@ impl<E: Source> PollEvented<E> {
         Ok(Self {
             io: Some(io),
             registration,
+            #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+            into_owned_fd: None,
         })
+    }
+
+    /// Registers a socket with the external I/O backend if the current runtime
+    /// has one, and with Mio otherwise.
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    #[track_caller]
+    pub(crate) fn new_socket(io: E) -> io::Result<Self>
+    where
+        E: std::os::fd::AsFd + Into<std::os::fd::OwnedFd>,
+    {
+        let handle = scheduler::Handle::current();
+        let interest = Interest::READABLE | Interest::WRITABLE;
+        if handle.driver().io().is_external() {
+            let registration = Registration::new_external(io.as_fd(), interest, handle)?;
+            Ok(Self {
+                io: Some(io),
+                registration,
+                into_owned_fd: Some(E::into),
+            })
+        } else {
+            Self::new_with_interest_and_handle(io, interest, handle)
+        }
     }
 
     /// Returns a reference to the registration.
@@ -133,6 +159,12 @@ impl<E: Source> PollEvented<E> {
     /// Deregisters the inner io from the registration and returns a Result containing the inner io.
     #[cfg(any(feature = "net", feature = "process"))]
     pub(crate) fn into_inner(mut self) -> io::Result<E> {
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        if self.into_owned_fd.is_some() {
+            // Keep the source in self if detach fails, so Drop can retire it.
+            self.registration.detach_external()?;
+            return Ok(self.io.take().unwrap());
+        }
         let mut inner = self.io.take().unwrap(); // As io shouldn't ever be None, just unwrap here.
         self.registration.deregister(&mut inner)?;
         Ok(inner)
@@ -312,6 +344,11 @@ impl<E: Source + fmt::Debug> fmt::Debug for PollEvented<E> {
 impl<E: Source> Drop for PollEvented<E> {
     fn drop(&mut self) {
         if let Some(mut io) = self.io.take() {
+            #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+            if let Some(into_owned_fd) = self.into_owned_fd {
+                self.registration.retire_external(into_owned_fd(io));
+                return;
+            }
             // Ignore errors
             let _ = self.registration.deregister(&mut io);
         }

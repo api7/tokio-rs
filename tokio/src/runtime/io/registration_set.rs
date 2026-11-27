@@ -121,6 +121,19 @@ impl RegistrationSet {
         // SAFETY: the caller guarantees that `io` is part of this list.
         let _ = unsafe { synced.registrations.remove(io) };
     }
+
+    // The caller must make sure that `io` is part of the registration set and
+    // removes it only once.
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(super) unsafe fn remove_external(&self, synced: &mut Synced, io: &Arc<ScheduledIo>) {
+        if !synced.is_shutdown {
+            let io = NonNull::from(&**io);
+            // SAFETY: the caller guarantees that `io` is part of this list and
+            // removed once. Unlike a Mio registration, its address was never
+            // used as an event token, so it can be released right away.
+            let _ = unsafe { synced.registrations.remove(io) };
+        }
+    }
 }
 
 // Safety: `Arc` pins the inner data
