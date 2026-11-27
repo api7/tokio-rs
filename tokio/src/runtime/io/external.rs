@@ -48,6 +48,11 @@ pub trait ExternalIo: Send + Sync + 'static {
     /// call back into the runtime: it should only schedule a tick, for example
     /// by writing to an `eventfd` that the host watches.
     ///
+    /// Tokio can call this many times before the next tick, for example once
+    /// for each task that [`ExternalReadiness::deliver`] wakes outside a tick.
+    /// To notify the host only once, coalesce the calls, for example with a
+    /// flag that `wake` sets and the host clears before each tick.
+    ///
     /// [`LocalRuntime::external_io_tick`]: crate::runtime::LocalRuntime::external_io_tick
     fn wake(&self);
 }
@@ -134,4 +139,13 @@ impl ExternalReadiness {
     pub(crate) fn invalidate(&self) {
         self.inner.active.store(false, Ordering::Release);
     }
+}
+
+/// The error for an I/O resource that a runtime with external I/O does not
+/// support.
+pub(crate) fn unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "only `TcpStream` and `UdpSocket` are supported with external I/O",
+    )
 }

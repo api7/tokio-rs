@@ -448,11 +448,12 @@ pub mod external_io {
     //!
     //! Only [`TcpStream`] and [`UdpSocket`] are registered with the host.
     //! Other I/O resources are not supported on such a runtime: for example,
-    //! [`TcpListener::bind`] fails with [`ErrorKind::Unsupported`], and
-    //! creating a signal listener panics.
+    //! [`TcpListener::bind`] and creating a signal listener fail with
+    //! [`ErrorKind::Unsupported`]. File operations use the blocking pool, also
+    //! with the unstable `io-uring` feature.
     //!
     //! The runtime never waits by itself, so drive it with ticks:
-    //! [`LocalRuntime::block_on`] panics.
+    //! [`LocalRuntime::block_on`] panics, and the clock cannot be paused.
     //!
     //! # Examples
     //!

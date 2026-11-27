@@ -15,7 +15,7 @@ use std::net::{
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use tokio::io::{Interest, Ready};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::external_io::{ExternalIo, ExternalReadiness, ExternalRegistration};
 use tokio::runtime::{Builder, LocalRuntime};
+use tokio::task::JoinHandle;
 
 /// The token of the `Waker` that `ExternalIo::wake` uses.
 const WAKE_TOKEN: Token = Token(usize::MAX);
@@ -86,10 +87,7 @@ impl Host {
     {
         let task = rt.spawn_local(future);
         self.run_until(rt, || task.is_finished());
-        match futures::executor::block_on(task) {
-            Ok(output) => output,
-            Err(error) => std::panic::resume_unwind(error.into_panic()),
-        }
+        join(task)
     }
 
     /// Ticks `rt` and dispatches socket readiness until `done` returns `true`.
@@ -232,6 +230,14 @@ fn ready_of(event: &mio::event::Event) -> Ready {
     ready
 }
 
+/// Returns the output of a finished task, or resumes its panic.
+fn join<T>(task: JoinHandle<T>) -> T {
+    match futures::executor::block_on(task) {
+        Ok(output) => output,
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
+    }
+}
+
 /// Accepts one connection and echoes `len` bytes back.
 fn echo_peer(len: usize) -> (SocketAddr, thread::JoinHandle<()>) {
     let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
@@ -320,6 +326,35 @@ fn udp_socket_round_trip() {
 }
 
 #[test]
+fn many_sockets_share_the_host() {
+    const SOCKETS: usize = 32;
+    let host = Host::new();
+    let mut rt = host.runtime();
+    let mut peers = Vec::new();
+    let mut tasks = Vec::new();
+    for i in 0..SOCKETS {
+        let (addr, peer) = echo_peer(64);
+        peers.push(peer);
+        tasks.push(rt.spawn_local(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let data = [i as u8; 64];
+            write_all(&stream, &data).await;
+            let mut reply = [0; 64];
+            read_exact(&stream, &mut reply).await;
+            reply == data
+        }));
+    }
+
+    host.run_until(&mut rt, || tasks.iter().all(|task| task.is_finished()));
+    for (task, peer) in tasks.into_iter().zip(peers) {
+        // Each socket got its own reply.
+        assert!(join(task));
+        peer.join().unwrap();
+    }
+    assert_eq!(host.counts(), (SOCKETS, 0, SOCKETS));
+}
+
+#[test]
 fn into_std_detaches_the_socket() {
     let host = Host::new();
     let mut rt = host.runtime();
@@ -391,6 +426,32 @@ fn listeners_are_not_supported() {
     assert_eq!(host.counts(), (0, 0, 0));
 }
 
+#[cfg(feature = "signal")]
+#[test]
+fn signals_are_not_supported() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let rt = Host::new().runtime();
+    let _guard = rt.enter();
+    let error = signal(SignalKind::hangup()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+}
+
+#[cfg(all(tokio_unstable, feature = "io-uring", feature = "fs"))]
+#[test]
+fn file_operations_use_the_blocking_pool() {
+    let host = Host::new();
+    let mut rt = host.runtime();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"data").unwrap();
+    let path = file.path().to_owned();
+
+    // io_uring cannot run here, as Tokio has no Mio registry to watch its
+    // completions with.
+    let data = host.run(&mut rt, async move { tokio::fs::read(path).await.unwrap() });
+    assert_eq!(data, b"data");
+}
+
 #[test]
 fn ticks_report_the_next_timer() {
     let host = Host::new();
@@ -427,6 +488,37 @@ fn ticks_run_at_most_max_tasks() {
     assert_eq!(runs.get(), 2);
     assert_eq!(rt.external_io_tick(1), None);
     assert_eq!(runs.get(), 3);
+}
+
+#[test]
+fn ticks_without_a_task_budget_only_run_timers() {
+    let host = Host::new();
+    let mut rt = host.runtime();
+    let runs = Rc::new(Cell::new(0));
+    let task = rt.spawn_local({
+        let runs = runs.clone();
+        async move {
+            runs.set(runs.get() + 1);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    // The task is ready, but the tick does not run it.
+    assert_eq!(rt.external_io_tick(0), Some(Duration::ZERO));
+    assert_eq!(runs.get(), 0);
+    // The task runs and sets its timer.
+    assert!(rt.external_io_tick(1).is_some());
+    assert_eq!(runs.get(), 1);
+
+    // Once the timer is due, a tick runs it, and the task is ready again.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.external_io_tick(0) != Some(Duration::ZERO) {
+        assert!(Instant::now() < deadline, "the timer did not fire");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!task.is_finished());
+    assert_eq!(rt.external_io_tick(1), None);
+    assert!(task.is_finished());
 }
 
 #[test]
@@ -493,6 +585,97 @@ fn readiness_is_delivered_again_after_would_block() {
 }
 
 #[test]
+fn the_peer_closing_the_connection_is_reported() {
+    let host = Host::new();
+    let mut rt = host.runtime();
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || drop(listener.accept().unwrap()));
+
+    let (read_closed, read) = host.run(&mut rt, async move {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        loop {
+            let ready = stream.ready(Interest::READABLE).await.unwrap();
+            match stream.try_read(&mut [0; 16]) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => break (ready.is_read_closed(), result.unwrap()),
+            }
+        }
+    });
+    peer.join().unwrap();
+
+    // The host reported the end of the stream, and the read returned it.
+    assert_eq!((read_closed, read), (true, 0));
+}
+
+#[test]
+fn a_reset_connection_reports_the_error() {
+    let host = Host::new();
+    let mut rt = host.runtime();
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let peer = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        // Reset the connection only once it is connected, so that `connect`
+        // succeeds.
+        rx.recv().unwrap();
+        // Closing with a zero linger time resets the connection.
+        socket2::SockRef::from(&stream)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+    });
+
+    let error = host.run(&mut rt, async move {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        tx.send(()).unwrap();
+        loop {
+            stream.readable().await.unwrap();
+            match stream.try_read(&mut [0; 16]) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => break result.unwrap_err(),
+            }
+        }
+    });
+    peer.join().unwrap();
+
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+}
+
+#[test]
+fn error_readiness_only_wakes_tasks_that_wait_for_errors() {
+    let host = Host::new();
+    let mut rt = host.runtime();
+    // The connection waits in the backlog; nothing needs to accept it.
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stream = host.run(
+        &mut rt,
+        async move { TcpStream::connect(addr).await.unwrap() },
+    );
+    let stream = Rc::new(stream);
+    let sink = host.last_sink();
+    let wait = |interest| {
+        let stream = stream.clone();
+        async move { stream.ready(interest).await.unwrap() }
+    };
+    let reader = rt.spawn_local(wait(Interest::READABLE));
+    let error_waiter = rt.spawn_local(wait(Interest::ERROR));
+    rt.external_io_tick(64);
+
+    assert!(sink.deliver(Ready::ERROR));
+    rt.external_io_tick(64);
+    assert!(error_waiter.is_finished());
+    assert!(!reader.is_finished());
+
+    // As with Mio, a closed direction wakes its tasks.
+    assert!(sink.deliver(Ready::READ_CLOSED));
+    rt.external_io_tick(64);
+    assert!(join(error_waiter).is_error());
+    assert!(join(reader).is_read_closed());
+}
+
+#[test]
 fn sockets_that_outlive_the_runtime_ignore_readiness() {
     let host = Host::new();
     let mut rt = host.runtime();
@@ -544,4 +727,21 @@ fn unsupported_builders_are_rejected() {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
+    #[cfg(tokio_unstable)]
+    {
+        let error = Builder::new_current_thread()
+            .unhandled_panic(tokio::runtime::UnhandledPanic::ShutdownRuntime)
+            .build_local_with_external_io(Arc::new(Host::new()))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(feature = "test-util")]
+#[test]
+#[should_panic(expected = "without external I/O")]
+fn the_clock_cannot_be_paused() {
+    let rt = Host::new().runtime();
+    let _guard = rt.enter();
+    tokio::time::pause();
 }

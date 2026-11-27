@@ -67,6 +67,9 @@ impl LocalRuntime {
     ///
     /// In every case, a call to [`ExternalIo::wake`] asks for an earlier tick.
     ///
+    /// With a `max_tasks` of zero, a tick only runs the due timers, which can
+    /// make tasks ready for the next tick.
+    ///
     /// # Panics
     ///
     /// Panics if the runtime was not built with

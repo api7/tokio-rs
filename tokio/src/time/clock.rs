@@ -323,6 +323,10 @@ cfg_test_util! {
             let mut inner = self.inner.lock();
 
             if !inner.enable_pausing {
+                #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+                return Err("`time::pause()` requires the `current_thread` Tokio runtime \
+                        without external I/O. This is the default Runtime used by `#[tokio::test]`.");
+                #[cfg(not(all(feature = "external-io-probe", target_os = "linux")))]
                 return Err("`time::pause()` requires the `current_thread` Tokio runtime. \
                         This is the default Runtime used by `#[tokio::test].");
             }
