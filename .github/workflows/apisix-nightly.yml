@@ -60,9 +60,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install cargo-audit ${{ env.cargo_audit }}
         run: cargo install cargo-audit --locked --version "$cargo_audit"
-      # Unsound code counts as a failure, not only vulnerabilities.
+      # Unsound and unmaintained crates fail as well as vulnerabilities, like
+      # the cargo-deny defaults upstream uses. RUSTSEC-2026-0441 (pin-utils,
+      # a dev dependency) is ignored as on upstream tokio-1.54.x
+      # (tokio-rs/tokio#8762).
       - name: Audit the locked dependencies of this line
-        run: cargo audit --deny unsound
+        run: cargo audit --deny unsound --deny unmaintained --ignore RUSTSEC-2026-0441
       # cargo audit skips the workspace crates, tokio included, so audit the
       # upstream release that the line is based on separately. A yanked base
       # release also fails.
@@ -74,4 +77,4 @@ jobs:
           cd "$project"
           cargo add "tokio@=$version" --features full
           cargo generate-lockfile
-          cargo audit --deny unsound --deny yanked
+          cargo audit --deny unsound --deny unmaintained --deny yanked --ignore RUSTSEC-2026-0441

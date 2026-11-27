@@ -183,10 +183,12 @@ from the default branch:
   change affects a patch: open an issue and resolve it before the next base
   switch. Patches reported as already upstream can be dropped at that switch.
 - **advisories** runs `cargo audit` on the locked dependencies of the line and
-  on the upstream release in `apisix/BASE`. It fails on vulnerabilities and on
-  unsound code, and when the base release is yanked. When an advisory affects
-  APISIX, switch the base to a fixed release or backport the fix, then cut a
-  release.
+  on the upstream release in `apisix/BASE`. It fails on vulnerabilities, on
+  unsound and on unmaintained crates, and when the base release is yanked. Like
+  upstream on `tokio-1.54.x` (tokio-rs/tokio#8762), it ignores
+  RUSTSEC-2026-0441, the unmaintained pin-utils dev dependency. When an
+  advisory affects APISIX, switch the base to a fixed release or backport the
+  fix, then cut a release.
 
 Check the maintenance tooling itself with `apisix/scripts/tests/run.sh`.
 
@@ -269,6 +271,7 @@ These settings live outside the repository and need an administrator:
   - `Security Audit` runs `cargo deny check` every day from the default
     branch, and `Pull Request Security Audit` runs it when a manifest changes.
     The cargo deny job checks the same licenses, bans and sources policy on
-    every pull request, and the nightly advisories job checks advisories,
-    failing on unsound code too.
+    every pull request, and the nightly advisories job checks advisories
+    with the same ignore list, failing on unsound and unmaintained crates as
+    cargo-deny does.
   - `Pull Request Labeler` only does anything in tokio-rs/tokio.
