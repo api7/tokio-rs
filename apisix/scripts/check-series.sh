@@ -6,9 +6,9 @@
 # Usage: apisix/scripts/check-series.sh [--verify-upstream] [REV]
 #
 #   --verify-upstream  also check, in the upstream repository, that BASE_TAG
-#                      still names BASE_COMMIT and that every Backport makes the
-#                      same change as the upstream commit it names (needs
-#                      network access)
+#                      still names BASE_COMMIT, and that every Backport is an
+#                      unmodified commit of upstream master or a tokio-*.x
+#                      branch (needs network access)
 #   REV                tip of the series to lint (default: HEAD)
 #
 # Exit status: 0 when the series follows the rules, 1 when it does not, and 2
@@ -62,6 +62,22 @@ count_lines() {
     grep -c . <<<"$1" || true
 }
 
+# fetch_upstream_heads: set $upstream_heads to the tips of the upstream master
+# and tokio-*.x branches and fetch them, once. GitHub also serves commits that
+# only a pull request ref holds, so being fetchable does not mean merged.
+upstream_heads=''
+fetch_upstream_heads() {
+    local refs
+    [ -z "$upstream_heads" ] || return 0
+    refs=$(git ls-remote "$upstream_url" refs/heads/master 'refs/heads/tokio-*') ||
+        die "cannot list the branches of $upstream_url"
+    upstream_heads=$(awk '{ print $1 }' <<<"$refs")
+    [ -n "$upstream_heads" ] || die "$upstream_url has no master or tokio-* branch"
+    # shellcheck disable=SC2086 # one argument per branch tip
+    git fetch -q --no-tags "$upstream_url" $upstream_heads ||
+        die "cannot fetch the branches of $upstream_url"
+}
+
 # Matching is done on here-strings rather than pipes: with pipefail, a
 # "producer | grep -q" pipeline fails when grep exits before the producer
 # finishes writing.
@@ -107,24 +123,32 @@ check_subject() {
 
 # check_backport SHA WHERE: a backport names its upstream commit in exactly one
 # "(cherry picked from commit ...)" line, as git cherry-pick -x writes it. With
-# --verify-upstream it must make the same change as that commit and keep its
-# author. The canary skips backports, so an unchecked label would hide a patch
-# from it.
+# --verify-upstream, that commit must be on upstream master or a tokio-*.x
+# branch, and the backport must make the same change and keep its author. The
+# canary skips backports, so an unchecked label would hide a patch from it.
 check_backport() {
-    local sha=$1 where=$2 sources ours theirs
+    local sha=$1 where=$2 sources ours theirs head merged=0
     sources=$(git log -1 --format=%B "$sha" | sed -n 's/^(cherry picked from commit \([0-9a-f]\{40\}\))$/\1/p')
     if [ "$(count_lines "$sources")" != 1 ]; then
         problem "$where: a Backport needs exactly one \"(cherry picked from commit <sha>)\" line; use git cherry-pick -x"
         return 0
     fi
     [ "$verify_upstream" = 1 ] || return 0
-    if ! git cat-file -e "$sources^{commit}" 2>/dev/null &&
-        ! git fetch -q --no-tags "$upstream_url" "$sources" 2>/dev/null; then
-        problem "$where: cannot fetch $sources, the commit it backports, from $upstream_url"
+    fetch_upstream_heads
+    if git cat-file -e "$sources^{commit}" 2>/dev/null; then
+        for head in $upstream_heads; do
+            if git merge-base --is-ancestor "$sources" "$head"; then
+                merged=1
+                break
+            fi
+        done
+    fi
+    if [ "$merged" != 1 ]; then
+        problem "$where: $sources is not on upstream master or a tokio-*.x branch; a change that upstream has not merged is Submitted, not a Backport"
         return 0
     fi
-    ours=$(git show "$sha" | git patch-id --stable)
-    theirs=$(git show "$sources" | git patch-id --stable)
+    ours=$(git show "$sha" | git patch-id --verbatim)
+    theirs=$(git show "$sources" | git patch-id --verbatim)
     if [ "${ours%% *}" != "${theirs%% *}" ]; then
         problem "$where: its change differs from $sources, the upstream commit it backports"
     fi

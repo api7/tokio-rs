@@ -13,12 +13,12 @@ make_upstream "$upstream"
 make_fork "$upstream" "$fork"
 
 # An upstream fix on a release branch, made after the fork was cloned.
-git -C "$upstream" switch -q -c release base-1.0
+git -C "$upstream" switch -q -c tokio-1.0.x base-1.0
 change "$upstream" lock.txt 'locked' 'pin the toolchain'
 release_fix=$(git -C "$upstream" rev-parse HEAD)
 change "$upstream" lock2.txt 'locked too' 'pin another tool'
 release_fix2=$(git -C "$upstream" rev-parse HEAD)
-git -C "$fork" fetch -q origin release
+git -C "$fork" fetch -q origin tokio-1.0.x
 
 commit "$fork" 'feat(tokio): add a host-driven tick
 
@@ -196,7 +196,29 @@ Upstream-Status: Backport tokio-rs/tokio#4
 Drop-When: never
 (cherry picked from commit 1234567890abcdef1234567890abcdef12345678)'
 run_script "$fork" "$lint" --verify-upstream
-expect "a Backport of an unknown commit fails with --verify-upstream" 1 "cannot fetch 1234567890abcdef1234567890abcdef12345678"
+expect "a Backport of an unknown commit fails with --verify-upstream" 1 "1234567890abcdef1234567890abcdef12345678 is not on upstream master or a tokio-*.x branch"
+
+# A commit that only an upstream pull request ref holds is not merged.
+git -C "$upstream" switch -q -c proposal base-1.0
+change "$upstream" proposal.txt 'proposed' 'propose a change'
+proposal=$(git -C "$upstream" rev-parse HEAD)
+git -C "$upstream" update-ref refs/pull/1/head "$proposal"
+git -C "$upstream" switch -q tokio-1.0.x
+git -C "$upstream" branch -q -D proposal
+git -C "$fork" fetch -q origin refs/pull/1/head
+git -C "$fork" switch -q -C "case" valid
+git -C "$fork" cherry-pick -x "$proposal" >/dev/null
+git -C "$fork" commit -q --amend -F - <<EOF
+feat(tokio): take a proposed change
+
+Why.
+
+Upstream-Status: Backport tokio-rs/tokio#5
+Drop-When: never
+(cherry picked from commit $proposal)
+EOF
+run_script "$fork" "$lint" --verify-upstream
+expect "a Backport of an unmerged pull request fails with --verify-upstream" 1 "a change that upstream has not merged is Submitted, not a Backport"
 
 git -C "$fork" switch -q -C "case" valid
 change "$fork" apisix/NOTE 'note' 'ci(apisix): add a note
@@ -240,6 +262,17 @@ Why.
 Upstream-Status: Inappropriate test'
 run_script "$fork" "$lint" --verify-upstream
 expect "a base tag that upstream lacks fails" 1 "has no tag no-such-tag"
+
+git -C "$fork" switch -q -C "case" valid
+change "$fork" apisix/BASE "UPSTREAM_URL=$sandbox/no-such-upstream
+BASE_TAG=base-1.0
+BASE_COMMIT=$(git -C "$upstream" rev-parse 'base-1.0^{commit}')" 'ci(apisix): name an unreachable upstream
+
+Why.
+
+Upstream-Status: Inappropriate test'
+run_script "$fork" "$lint" --verify-upstream
+expect "an unreachable upstream is a setup error" 2 "cannot list the tags of"
 
 git -C "$fork" switch -q -C "case" valid
 change "$fork" apisix/BASE "UPSTREAM_URL=$upstream

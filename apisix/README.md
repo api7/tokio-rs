@@ -70,12 +70,15 @@ Every commit after `BASE_COMMIT` is a patch. The
      - `Pending [reference]`: meant for upstream but not proposed yet; may
        name the upstream issue.
      - `Submitted <reference>`: proposed upstream.
-     - `Backport <reference>`: an upstream commit applied unmodified with
-       `git cherry-pick -x`, which keeps its author. The lint requires exactly
+     - `Backport <reference>`: a commit that upstream `master` or a
+       `tokio-*.x` branch contains, applied unmodified with
+       `git cherry-pick -x`, which keeps its author. A commit that only an
+       open upstream pull request has is `Submitted`. The lint requires exactly
        one `(cherry picked from commit <sha>)` line. With `--verify-upstream`
-       it fetches that commit from upstream and requires the same change, as
-       compared by `git patch-id --stable`, and the same author. The nightly
-       canary skips backports, so the label must be right. An upstream change
+       it fetches the upstream branches and requires that one of them contains
+       that commit, and that the backport makes the same change, as compared
+       by `git patch-id --verbatim`, with the same author. The nightly canary
+       skips backports, so the label must be right. An upstream change
        that needs adapting is not a backport: mark it `Inappropriate` with the
        reference, and give it a `Drop-When`. A later upstream change to the
        same code is another Backport, never a fixup.
