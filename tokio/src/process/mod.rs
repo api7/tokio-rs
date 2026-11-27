@@ -859,8 +859,16 @@ impl Command {
     /// On Unix platforms this method will fail with `std::io::ErrorKind::WouldBlock`
     /// if the system process limit is reached (which includes other applications
     /// running on the system).
+    #[cfg_attr(all(feature = "external-io-probe", target_os = "linux"), doc = "")]
+    #[cfg_attr(
+        all(feature = "external-io-probe", target_os = "linux"),
+        doc = "On a runtime with [external I/O](crate::runtime::external_io), it fails \
+               with `std::io::ErrorKind::Unsupported` before it starts the process."
+    )]
     #[inline]
     pub fn spawn(&mut self) -> io::Result<Child> {
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        crate::runtime::io::external::check_process_support()?;
         // On two lines to circumvent a mutable borrow check failure.
         let child = self.std.spawn()?;
         self.build_child(child)
@@ -935,6 +943,8 @@ impl Command {
         &mut self,
         with: impl FnOnce(&mut StdCommand) -> io::Result<StdChild>,
     ) -> io::Result<Child> {
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        crate::runtime::io::external::check_process_support()?;
         // On two lines to circumvent a mutable borrow check failure.
         let child = with(&mut self.std)?;
         self.build_child(child)

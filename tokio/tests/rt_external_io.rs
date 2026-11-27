@@ -437,6 +437,33 @@ fn signals_are_not_supported() {
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
+#[cfg(feature = "process")]
+#[test]
+fn processes_are_not_started() {
+    let rt = Host::new().runtime();
+    let _guard = rt.enter();
+    let dir = tempfile::tempdir().unwrap();
+    let started = dir.path().join("started");
+
+    let error = tokio::process::Command::new("touch")
+        .arg(&started)
+        .spawn()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    #[cfg(tokio_unstable)]
+    {
+        let error = tokio::process::Command::new("touch")
+            .arg(&started)
+            .spawn_with(std::process::Command::spawn)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+    // A started process would have created the file by now, and nothing
+    // would reap it.
+    thread::sleep(Duration::from_millis(200));
+    assert!(!started.exists());
+}
+
 #[cfg(all(tokio_unstable, feature = "io-uring", feature = "fs"))]
 #[test]
 fn file_operations_use_the_blocking_pool() {

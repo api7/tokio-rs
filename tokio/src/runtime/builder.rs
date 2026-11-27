@@ -1207,8 +1207,9 @@ impl Builder {
     /// The I/O and time drivers are always enabled, whatever [`enable_io`] and
     /// [`enable_time`] say, and the park callbacks are never called. As with
     /// [`build_local`], the runtime can only be used on the thread that
-    /// creates it. Its clock cannot be paused, as a paused clock only advances
-    /// while the runtime waits by itself: `time::pause` panics on it.
+    /// creates it. Its clock cannot be paused, as a paused clock only
+    /// auto-advances while the runtime waits by itself: `time::pause` panics on
+    /// it.
     ///
     /// # Errors
     ///
