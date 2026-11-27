@@ -1,0 +1,5 @@
+# Upstream base of this maintenance line, read by apisix/scripts/*.sh.
+# Change it only while switching the base (apisix/README.md#switching-the-base).
+UPSTREAM_URL=https://github.com/tokio-rs/tokio.git
+BASE_TAG=tokio-1.54.1
+BASE_COMMIT=b53b2001ed2ccfd9b87e32a0c6da1a1eebdc80b8

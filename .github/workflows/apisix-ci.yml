@@ -1,0 +1,429 @@
+# Checks for the APISIX maintenance line (dev and apisix/**).
+#
+# The upstream ci.yml and loom.yml only run on master and tokio-*.x, so this
+# workflow runs the subset of their jobs that covers what APISIX uses, plus the
+# patch series lint and the cargo-deny policy checks. The commands follow
+# upstream ci.yml at the base recorded in apisix/BASE, and the toolchains are
+# pinned as on its upstream release branch, tokio-1.54.x (see the backport of
+# tokio-rs/tokio#8792). Comments mark where this workflow differs on purpose,
+# and apisix/README.md#checks lists the upstream jobs it leaves out. Update
+# both when the base changes (apisix/README.md#switching-the-base).
+#
+# Throughout, toolchains come from rustup and Valgrind from the Ubuntu archive
+# instead of the third-party actions that upstream uses, and nothing is cached,
+# so the only action is actions/checkout, pinned by commit.
+name: APISIX CI
+
+on:
+  pull_request:
+    branches: ["dev", "apisix/**"]
+  push:
+    branches: ["dev", "apisix/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+  # Pinned as in upstream ci.yml of tokio-1.54.x.
+  rust_stable: "1.99"
+  rust_nightly: nightly-2025-10-12
+  rust_clippy: "1.88"
+  rust_min: "1.85"
+  # As in upstream stress-test.yml and the valgrind job of ci.yml.
+  rust_valgrind: "1.85"
+  # The toolchain of the APISIX runtime build.
+  rust_apisix: "1.100.0"
+  TOKIO_STABLE_FEATURES: "full,test-util"
+  # The releases that the ecosystem jobs test. They are pinned so that a new
+  # release cannot break every pull request; review them when the base
+  # changes. Upstream ci.yml takes the nearest tag of any name instead.
+  hyper_tag: v1.13.0
+  quinn_tag: quinn-0.11.12
+  cargo_deny: "0.22.1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  series:
+    name: patch series
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Lint the pull request head, not the merge preview, and keep the
+          # history back to the upstream base.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Check the shell scripts
+        run: shellcheck --external-sources apisix/scripts/*.sh apisix/scripts/tests/*.sh
+      - name: Test the maintenance scripts
+        run: apisix/scripts/tests/run.sh
+      - name: Lint the patch series
+        run: apisix/scripts/check-series.sh --verify-upstream HEAD
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_stable }}
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal --component rustfmt --no-self-update
+          rustup default "$rust_stable"
+      - name: rustfmt --check
+        run: |
+          if ! git ls-files -z '*.rs' | xargs -0 rustfmt --check --edition 2021; then
+            printf "Please run \`rustfmt --edition 2021 \$(git ls-files '*.rs')\` to fix rustfmt errors.\n" >&2
+            exit 1
+          fi
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_clippy }}
+        run: |
+          rustup toolchain install "$rust_clippy" --profile minimal --component clippy --no-self-update
+          rustup default "$rust_clippy"
+      - name: clippy --workspace --features ${{ env.TOKIO_STABLE_FEATURES }}
+        run: |
+          cargo clippy --workspace --tests --no-deps --features "$TOKIO_STABLE_FEATURES"
+          # Check again without the workspace patch of the tokio crates, as
+          # upstream does.
+          cp Cargo.lock Cargo.lock.bak
+          perl -0 -i.bak -pe 's/\[patch\.crates-io\].+\n\[/[/s' Cargo.toml
+          cargo clippy --workspace --exclude tokio --tests --no-deps --features "$TOKIO_STABLE_FEATURES"
+      - name: clippy --workspace --all-features --unstable
+        env:
+          RUSTFLAGS: --cfg tokio_unstable -Dwarnings
+        run: |
+          mv Cargo.lock.bak Cargo.lock
+          mv Cargo.toml Cargo.toml.nopatch
+          mv Cargo.toml.bak Cargo.toml
+          cargo clippy --workspace --tests --no-deps --all-features
+          mv Cargo.toml.nopatch Cargo.toml
+          cargo clippy --workspace --exclude tokio --tests --no-deps --all-features
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_nightly }}
+        run: |
+          rustup toolchain install "$rust_nightly" --profile minimal --no-self-update
+          rustup default "$rust_nightly"
+      - name: doc --lib --all-features
+        env:
+          RUSTFLAGS: --cfg docsrs --cfg tokio_unstable
+          RUSTDOCFLAGS: --cfg docsrs --cfg tokio_unstable -Dwarnings
+        run: cargo doc --lib --no-deps --document-private-items --features "$TOKIO_STABLE_FEATURES,tracing,io-uring,taskdump"
+
+  minrust:
+    name: minrust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_min }}
+        run: |
+          rustup toolchain install "$rust_min" --profile minimal --no-self-update
+          rustup default "$rust_min"
+      # Like an upstream backport branch, only the tokio crate is checked.
+      # --locked also fails when Cargo.lock does not match the manifests.
+      - name: cargo check
+        run: cargo check --locked -p tokio --all-features
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo-deny ${{ env.cargo_deny }}
+        env:
+          RUSTFLAGS: ""
+        run: cargo install cargo-deny --locked --version "$cargo_deny"
+      # The licenses, bans and sources policy of deny.toml, which upstream
+      # checks in audit.yml and pr-audit.yml. Advisories change from day to
+      # day, so apisix-nightly.yml checks them instead of every pull request.
+      - name: cargo deny check bans licenses sources
+        run: cargo deny check bans licenses sources
+
+  basics:
+    name: basic checks
+    runs-on: ubuntu-latest
+    needs: [series, fmt, clippy, docs, minrust]
+    steps:
+      - run: exit 0
+
+  test-tokio-full:
+    name: test tokio full
+    needs: basics
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_stable }}
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal --no-self-update
+          rustup default "$rust_stable"
+      # Upstream runs cargo nextest and then the doc tests. cargo test runs
+      # both and needs no extra tool.
+      - name: test tokio full
+        working-directory: tokio
+        run: cargo test --no-fail-fast --features full
+
+  test-unstable:
+    name: test tokio full --unstable ${{ matrix.extra_features }}
+    needs: basics
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        extra_features: ["", "io-uring"]
+    env:
+      RUSTFLAGS: --cfg tokio_unstable -Dwarnings
+      RUSTDOCFLAGS: --cfg tokio_unstable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_stable }}
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal --no-self-update
+          rustup default "$rust_stable"
+      - name: test tokio full --cfg tokio_unstable
+        working-directory: tokio
+        env:
+          EXTRA_FEATURES: ${{ matrix.extra_features }}
+        run: cargo test --no-fail-fast --features "$TOKIO_STABLE_FEATURES,$EXTRA_FEATURES"
+
+  test-apisix-toolchain:
+    name: test tokio full --unstable (APISIX toolchain)
+    needs: basics
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RUSTFLAGS: --cfg tokio_unstable -Dwarnings
+      RUSTDOCFLAGS: --cfg tokio_unstable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_apisix }}
+        run: |
+          rustup toolchain install "$rust_apisix" --profile minimal --no-self-update
+          rustup default "$rust_apisix"
+      - name: test tokio full --cfg tokio_unstable
+        working-directory: tokio
+        run: cargo test --no-fail-fast --features "$TOKIO_STABLE_FEATURES"
+
+  test-aarch64:
+    name: test tokio full --unstable (aarch64)
+    needs: basics
+    # APISIX ships arm64 builds, and aarch64 orders memory more weakly than
+    # x86-64. Upstream covers it only through emulated cross tests.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      RUSTFLAGS: --cfg tokio_unstable -Dwarnings
+      RUSTDOCFLAGS: --cfg tokio_unstable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_stable }}
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal --no-self-update
+          rustup default "$rust_stable"
+      - name: test tokio full --cfg tokio_unstable
+        working-directory: tokio
+        run: cargo test --no-fail-fast --features "$TOKIO_STABLE_FEATURES"
+
+  loom:
+    name: loom ${{ matrix.scope }}
+    needs: basics
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # The scopes of the upstream loom-current-thread and loom-time-driver
+        # jobs, which cover the scheduler, time and I/O drivers.
+        scope: ["loom_current_thread", "runtime::time", "runtime::io"]
+    env:
+      RUSTFLAGS: -Dwarnings --cfg loom --cfg tokio_unstable -C debug_assertions
+      LOOM_MAX_PREEMPTIONS: 2
+      LOOM_MAX_BRANCHES: 10000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_stable }}
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal --no-self-update
+          rustup default "$rust_stable"
+      - name: run tests
+        working-directory: tokio
+        env:
+          SCOPE: ${{ matrix.scope }}
+        run: cargo test --lib --release --features full -- --nocapture "$SCOPE"
+
+  stress-test:
+    name: stress test
+    needs: basics
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_valgrind }}
+        run: |
+          rustup toolchain install "$rust_valgrind" --profile minimal --no-self-update
+          rustup default "$rust_valgrind"
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+      - name: Compile the stress test
+        run: cargo build -p stress-test --release --example simple_echo_tcp
+      - name: Run it under Valgrind
+        run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all --fair-sched=yes ./target/release/examples/simple_echo_tcp
+
+  valgrind:
+    name: valgrind
+    needs: basics
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_valgrind }}
+        run: |
+          rustup toolchain install "$rust_valgrind" --profile minimal --no-self-update
+          rustup default "$rust_valgrind"
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+      - name: cargo build test-mem
+        working-directory: tests-integration
+        run: cargo build --features rt-net --bin test-mem
+      - name: Run valgrind test-mem
+        run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all --fair-sched=yes ./target/debug/test-mem
+      - name: cargo build test-process-signal
+        working-directory: tests-integration
+        run: cargo build --features rt-process-signal --bin test-process-signal
+      - name: Run valgrind test-process-signal
+        run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all --fair-sched=yes ./target/debug/test-process-signal
+
+  test-hyper:
+    name: test hyper
+    needs: basics
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_stable }}
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal --no-self-update
+          rustup default "$rust_stable"
+      - name: Clone hyper ${{ env.hyper_tag }}
+        run: git clone --depth 1 --branch "$hyper_tag" https://github.com/hyperium/hyper.git
+      - name: Use the tokio crates from this repository
+        working-directory: hyper
+        run: |
+          {
+            echo '[workspace]'
+            echo '[patch.crates-io]'
+            echo 'tokio = { path = "../tokio" }'
+            echo 'tokio-util = { path = "../tokio-util" }'
+            echo 'tokio-stream = { path = "../tokio-stream" }'
+            echo 'tokio-test = { path = "../tokio-test" }'
+          } >>Cargo.toml
+          git diff
+          # A committed lockfile keeps its tokio, and Cargo only warns that the
+          # patch is unused, so update the lock and require that every crate
+          # resolves tokio to this repository. Upstream ci.yml does neither.
+          cargo update -p tokio
+          sources=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "tokio") | .manifest_path')
+          echo "tokio resolves to: $sources"
+          if [ "$sources" != "$GITHUB_WORKSPACE/tokio/Cargo.toml" ]; then
+            echo "Not every crate uses the tokio of this repository" >&2
+            exit 1
+          fi
+      - name: Test hyper
+        working-directory: hyper
+        run: cargo test --no-fail-fast --features full
+
+  test-quinn:
+    name: test Quinn
+    needs: basics
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.rust_stable }}
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal --no-self-update
+          rustup default "$rust_stable"
+      - name: Clone Quinn ${{ env.quinn_tag }}
+        run: git clone --depth 1 --branch "$quinn_tag" https://github.com/quinn-rs/quinn.git
+      - name: Use the tokio crate from this repository
+        working-directory: quinn
+        run: |
+          {
+            echo '[patch.crates-io]'
+            echo 'tokio = { path = "../tokio" }'
+          } >>Cargo.toml
+          git diff
+          # A committed lockfile keeps its tokio, and Cargo only warns that the
+          # patch is unused, so update the lock and require that every crate
+          # resolves tokio to this repository. Upstream ci.yml does neither.
+          cargo update -p tokio
+          sources=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "tokio") | .manifest_path')
+          echo "tokio resolves to: $sources"
+          if [ "$sources" != "$GITHUB_WORKSPACE/tokio/Cargo.toml" ]; then
+            echo "Not every crate uses the tokio of this repository" >&2
+            exit 1
+          fi
+      - name: Test Quinn
+        working-directory: quinn
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --no-fail-fast
+
+  # The one check to require in the branch rules.
+  ci-pass:
+    name: APISIX CI passed
+    if: always()
+    needs:
+      - basics
+      - deny
+      - test-tokio-full
+      - test-unstable
+      - test-apisix-toolchain
+      - test-aarch64
+      - loom
+      - stress-test
+      - valgrind
+      - test-hyper
+      - test-quinn
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" != success ]; then
+              echo "A required job finished with: $result" >&2
+              exit 1
+            fi
+          done
