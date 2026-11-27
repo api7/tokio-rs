@@ -17,6 +17,11 @@ use std::io;
 use std::thread::ThreadId;
 use std::time::Duration;
 
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+use crate::runtime::external_io::ExternalIo;
+#[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+use std::sync::Arc;
+
 /// Builds Tokio Runtime with custom configuration values.
 ///
 /// Methods can be chained in order to set the configuration values. The
@@ -1191,6 +1196,59 @@ impl Builder {
         }
     }
 
+    /// Creates a [`LocalRuntime`] whose I/O and timers are driven by a host
+    /// event loop.
+    ///
+    /// **Experimental.** See [`runtime::external_io`] for how the host drives
+    /// the runtime. The runtime registers its [`TcpStream`] and [`UdpSocket`]
+    /// sockets with `backend`, and it does not wait by itself: the host calls
+    /// [`LocalRuntime::external_io_tick`].
+    ///
+    /// The I/O and time drivers are always enabled, whatever [`enable_io`] and
+    /// [`enable_time`] say, and the park callbacks are never called. As with
+    /// [`build_local`], the runtime can only be used on the thread that
+    /// creates it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error of kind [`ErrorKind::InvalidInput`] if the builder was
+    /// not created with [`Builder::new_current_thread`], or if the clock is set
+    /// to start paused.
+    ///
+    /// [`runtime::external_io`]: crate::runtime::external_io
+    /// [`TcpStream`]: crate::net::TcpStream
+    /// [`UdpSocket`]: crate::net::UdpSocket
+    /// [`LocalRuntime::external_io_tick`]: crate::runtime::LocalRuntime::external_io_tick
+    /// [`enable_io`]: Builder::enable_io
+    /// [`enable_time`]: Builder::enable_time
+    /// [`build_local`]: Builder::build_local
+    /// [`ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "external-io-probe", target_os = "linux")))
+    )]
+    pub fn build_local_with_external_io(
+        &mut self,
+        backend: Arc<dyn ExternalIo>,
+    ) -> io::Result<LocalRuntime> {
+        use crate::runtime::local_runtime::LocalRuntimeScheduler;
+        if !matches!(self.kind, Kind::CurrentThread) || self.start_paused {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external I/O requires a current-thread runtime and an unpaused clock",
+            ));
+        }
+        let owner = std::thread::current().id();
+        let (scheduler, handle, blocking_pool) =
+            self.build_current_thread_runtime_components(Some(owner), Some(backend))?;
+        Ok(LocalRuntime::from_parts(
+            LocalRuntimeScheduler::CurrentThread(scheduler),
+            handle,
+            blocking_pool,
+        ))
+    }
+
     fn get_cfg(&self) -> driver::Cfg {
         driver::Cfg {
             enable_pause_time: match self.kind {
@@ -1199,6 +1257,8 @@ impl Builder {
                 Kind::MultiThread => false,
             },
             enable_io: self.enable_io,
+            #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+            external_io: None,
             enable_time: self.enable_time,
             start_paused: self.start_paused,
             nevents: self.nevents,
@@ -1729,8 +1789,11 @@ impl Builder {
     fn build_current_thread_runtime(&mut self) -> io::Result<Runtime> {
         use crate::runtime::runtime::Scheduler;
 
-        let (scheduler, handle, blocking_pool) =
-            self.build_current_thread_runtime_components(None)?;
+        let (scheduler, handle, blocking_pool) = self.build_current_thread_runtime_components(
+            None,
+            #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+            None,
+        )?;
 
         Ok(Runtime::from_parts(
             Scheduler::CurrentThread(scheduler),
@@ -1744,8 +1807,11 @@ impl Builder {
 
         let tid = std::thread::current().id();
 
-        let (scheduler, handle, blocking_pool) =
-            self.build_current_thread_runtime_components(Some(tid))?;
+        let (scheduler, handle, blocking_pool) = self.build_current_thread_runtime_components(
+            Some(tid),
+            #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+            None,
+        )?;
 
         Ok(LocalRuntime::from_parts(
             LocalRuntimeScheduler::CurrentThread(scheduler),
@@ -1757,12 +1823,20 @@ impl Builder {
     fn build_current_thread_runtime_components(
         &mut self,
         local_tid: Option<ThreadId>,
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))] external_io: Option<
+            Arc<dyn ExternalIo>,
+        >,
     ) -> io::Result<(CurrentThread, Handle, BlockingPool)> {
         use crate::runtime::scheduler;
         use crate::runtime::Config;
 
         let mut cfg = self.get_cfg();
         cfg.timer_flavor = TimerFlavor::Traditional;
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        if external_io.is_some() {
+            cfg.enable_time = true;
+            cfg.external_io = external_io;
+        }
         let (driver, driver_handle) = driver::Driver::new(cfg)?;
 
         // Blocking pool

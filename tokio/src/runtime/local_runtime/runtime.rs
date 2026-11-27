@@ -51,6 +51,47 @@ pub(crate) enum LocalRuntimeScheduler {
 }
 
 impl LocalRuntime {
+    /// Runs the due timers and up to `max_tasks` ready tasks of a runtime that
+    /// a host event loop drives.
+    ///
+    /// **Experimental.** See [`runtime::external_io`] for how the host drives
+    /// the runtime.
+    ///
+    /// The return value tells the host when to tick next:
+    ///
+    /// * `Some(Duration::ZERO)`: tasks are still ready, so tick again without
+    ///   waiting.
+    /// * `Some(delay)`: the next timer is due after `delay`.
+    /// * `None`: no timer is set, so wait for socket readiness or for
+    ///   [`ExternalIo::wake`].
+    ///
+    /// In every case, a call to [`ExternalIo::wake`] asks for an earlier tick.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime was not built with
+    /// [`Builder::build_local_with_external_io`], or if it is called on a
+    /// thread that is already running a runtime, for example from a task.
+    ///
+    /// [`runtime::external_io`]: crate::runtime::external_io
+    /// [`ExternalIo::wake`]: crate::runtime::external_io::ExternalIo::wake
+    /// [`Builder::build_local_with_external_io`]: crate::runtime::Builder::build_local_with_external_io
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "external-io-probe", target_os = "linux")))
+    )]
+    pub fn external_io_tick(&mut self, max_tasks: usize) -> Option<Duration> {
+        assert!(
+            self.handle.inner.driver().is_external_io(),
+            "`external_io_tick` requires a runtime built with `Builder::build_local_with_external_io`"
+        );
+        match &self.scheduler {
+            LocalRuntimeScheduler::CurrentThread(scheduler) => {
+                scheduler.external_io_tick(&self.handle.inner, max_tasks)
+            }
+        }
+    }
     pub(crate) fn from_parts(
         scheduler: LocalRuntimeScheduler,
         handle: Handle,
@@ -222,6 +263,10 @@ impl LocalRuntime {
     /// ```
     #[track_caller]
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        if self.handle.inner.driver().is_external_io() {
+            panic!("{}", crate::runtime::driver::EXTERNAL_IO_PARK);
+        }
         let fut_size = mem::size_of::<F>();
         let meta = SpawnMeta::new_unnamed(fut_size);
 

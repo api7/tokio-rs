@@ -25,6 +25,9 @@ keywords = ["io", "async", "non-blocking", "futures"]
 # Include nothing by default
 default = []
 
+# Experimental: lets a host event loop drive a `LocalRuntime` (Linux only).
+external-io-probe = ["net", "rt", "time"]
+
 # enable everything
 full = [
   "fs",

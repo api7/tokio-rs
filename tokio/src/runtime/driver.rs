@@ -36,6 +36,8 @@ pub(crate) struct Handle {
 
 pub(crate) struct Cfg {
     pub(crate) enable_io: bool,
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) external_io: Option<std::sync::Arc<dyn crate::runtime::external_io::ExternalIo>>,
     pub(crate) enable_time: bool,
     pub(crate) enable_pause_time: bool,
     pub(crate) start_paused: bool,
@@ -46,6 +48,16 @@ pub(crate) struct Cfg {
 
 impl Driver {
     pub(crate) fn new(cfg: Cfg) -> io::Result<(Self, Handle)> {
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        let (io_stack, io_handle, signal_handle) = match cfg.external_io {
+            Some(backend) => (
+                IoStack::External,
+                IoHandle::Enabled(crate::runtime::io::Handle::new_external(backend)),
+                Default::default(),
+            ),
+            None => create_io_stack(cfg.enable_io, cfg.nevents, cfg.nevents_busy)?,
+        };
+        #[cfg(not(all(feature = "external-io-probe", target_os = "linux")))]
         let (io_stack, io_handle, signal_handle) =
             create_io_stack(cfg.enable_io, cfg.nevents, cfg.nevents_busy)?;
 
@@ -102,6 +114,11 @@ impl Handle {
                 .as_ref()
                 .expect("A Tokio 1.x context was found, but IO is disabled. Call `enable_io` on the runtime builder to enable IO.")
         }
+
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        pub(crate) fn is_external_io(&self) -> bool {
+            self.io.as_ref().is_some_and(|io| io.is_external())
+        }
     }
 
     cfg_signal_internal_and_unix! {
@@ -148,10 +165,16 @@ impl Handle {
 cfg_io_driver! {
     pub(crate) type IoDriver = crate::runtime::io::Driver;
 
+    #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+    pub(crate) const EXTERNAL_IO_PARK: &str = "a runtime with external I/O cannot wait by itself; \
+        drive it with `LocalRuntime::external_io_tick`";
+
     #[derive(Debug)]
     pub(crate) enum IoStack {
         Enabled(ProcessDriver),
         Disabled(ParkThread),
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        External,
     }
 
     #[derive(Debug)]
@@ -185,6 +208,8 @@ cfg_io_driver! {
             match self {
                 IoStack::Enabled(v) => v.park(handle),
                 IoStack::Disabled(v) => v.park(),
+                #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+                IoStack::External => panic!("{}", EXTERNAL_IO_PARK),
             }
         }
 
@@ -192,6 +217,8 @@ cfg_io_driver! {
             match self {
                 IoStack::Enabled(v) => v.park_timeout(handle, duration),
                 IoStack::Disabled(v) => v.park_timeout(duration),
+                #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+                IoStack::External => panic!("{}", EXTERNAL_IO_PARK),
             }
         }
 
@@ -199,6 +226,8 @@ cfg_io_driver! {
             match self {
                 IoStack::Enabled(v) => v.shutdown(handle),
                 IoStack::Disabled(v) => v.shutdown(),
+                #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+                IoStack::External => handle.io().shutdown(),
             }
         }
     }

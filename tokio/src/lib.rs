@@ -349,6 +349,12 @@
 //! _Note: `AsyncRead` and `AsyncWrite` traits do not require any features and are
 //! always available._
 //!
+//! ## Experimental features
+//!
+//! - `external-io-probe`: Lets a host event loop drive the I/O and timers of a
+//!   `LocalRuntime`, see `tokio::runtime::external_io` (Linux only). It is not
+//!   part of `full`, and its API may change.
+//!
 //! ## Unstable features
 //!
 //! Some feature flags are only available when specifying the `tokio_unstable` flag:

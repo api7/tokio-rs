@@ -163,7 +163,11 @@ impl TcpStream {
         }
     }
 
+    #[track_caller]
     pub(crate) fn new(connected: mio::net::TcpStream) -> io::Result<TcpStream> {
+        #[cfg(all(feature = "external-io-probe", target_os = "linux"))]
+        let io = PollEvented::new_socket(connected)?;
+        #[cfg(not(all(feature = "external-io-probe", target_os = "linux")))]
         let io = PollEvented::new(connected)?;
         Ok(TcpStream { io })
     }
@@ -225,9 +229,7 @@ impl TcpStream {
     pub fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
         check_socket_for_blocking(&stream)?;
 
-        let io = mio::net::TcpStream::from_std(stream);
-        let io = PollEvented::new(io)?;
-        Ok(TcpStream { io })
+        Self::new(mio::net::TcpStream::from_std(stream))
     }
 
     /// Turns a [`tokio::net::TcpStream`] into a [`std::net::TcpStream`].
