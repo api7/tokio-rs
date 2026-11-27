@@ -1,0 +1,77 @@
+# Scheduled checks for the APISIX maintenance line.
+#
+# GitHub runs scheduled workflows from the default branch only, so the
+# schedule takes effect once dev is the default branch. Run the workflow by
+# hand to check another branch.
+name: APISIX nightly
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: 1
+  # The canary looks for upcoming upstream breakage, so it uses the newest
+  # stable toolchain on purpose.
+  rust_canary: stable
+  cargo_audit: "0.23.0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  canary:
+    name: replay on upstream master
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Fetch upstream master
+        run: |
+          url=$(sed -n 's/^UPSTREAM_URL=//p' apisix/BASE)
+          git fetch --no-tags "$url" +master:refs/remotes/upstream/master
+      - name: Replay the series
+        run: apisix/scripts/canary.sh --target refs/remotes/upstream/master --worktree "$RUNNER_TEMP/canary" HEAD
+      - name: Install Rust ${{ env.rust_canary }}
+        run: |
+          rustup toolchain install "$rust_canary" --profile minimal --no-self-update
+          rustup default "$rust_canary"
+      - name: Check and test tokio on the replayed tree
+        working-directory: ${{ runner.temp }}/canary/tokio
+        env:
+          RUSTFLAGS: --cfg tokio_unstable
+          RUSTDOCFLAGS: --cfg tokio_unstable
+        run: |
+          cargo check --all-features
+          cargo test --no-fail-fast --features full,test-util
+
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo-audit ${{ env.cargo_audit }}
+        run: cargo install cargo-audit --locked --version "$cargo_audit"
+      # Unsound code counts as a failure, not only vulnerabilities.
+      - name: Audit the locked dependencies of this line
+        run: cargo audit --deny unsound
+      # cargo audit skips the workspace crates, tokio included, so audit the
+      # upstream release that the line is based on separately. A yanked base
+      # release also fails.
+      - name: Audit the base release of tokio
+        run: |
+          version=$(sed -n 's/^BASE_TAG=tokio-//p' apisix/BASE)
+          project=$RUNNER_TEMP/base-release
+          cargo new --lib --vcs none --name base-release "$project"
+          cd "$project"
+          cargo add "tokio@=$version" --features full
+          cargo generate-lockfile
+          cargo audit --deny unsound --deny yanked

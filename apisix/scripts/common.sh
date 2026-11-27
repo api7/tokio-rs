@@ -15,6 +15,13 @@ base_value() {
     printf '%s\n' "$value"
 }
 
+# upstream_status REV: print the Upstream-Status trailer values of commit REV,
+# one per line.
+upstream_status() {
+    git log -1 --format=%B "$1" | git interpret-trailers --parse |
+        sed -n 's/^Upstream-Status: //p'
+}
+
 # fixup_target SUBJECT: print the subject that a fixup!, squash! or amend!
 # commit refers to, or nothing when SUBJECT is a regular subject.
 fixup_target() {
